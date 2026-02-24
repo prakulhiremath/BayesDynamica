@@ -11,14 +11,11 @@ class SwitchingKalmanFilter:
         T = observations.shape[0]
         dim = self.model.mu0.shape[0]
 
-        # Initialize regime probabilities
         regime_probs = self.model.pi0.copy()
 
-        # Initialize state estimates for each regime
         mus = [self.model.mu0.copy() for _ in range(self.K)]
         covs = [self.model.P0.copy() for _ in range(self.K)]
 
-        # Storage
         regime_history = np.zeros((T, self.K))
         state_history = np.zeros((T, self.K, dim))
 
@@ -26,14 +23,45 @@ class SwitchingKalmanFilter:
 
         for t in range(T):
 
-            # --- 1. Regime prediction ---
+            # --- 1️⃣ Mixing Step ---
+            mixed_mus = []
+            mixed_covs = []
+
+            for j in range(self.K):
+
+                # mixing probabilities
+                denom = np.sum(
+                    self.model.Pi[:, j] * regime_probs
+                )
+
+                mixing_probs = (
+                    self.model.Pi[:, j] * regime_probs
+                ) / denom
+
+                # mixed mean
+                mu_bar = np.zeros(dim)
+                for i in range(self.K):
+                    mu_bar += mixing_probs[i] * mus[i]
+
+                # mixed covariance
+                P_bar = np.zeros((dim, dim))
+                for i in range(self.K):
+                    diff = mus[i] - mu_bar
+                    P_bar += mixing_probs[i] * (
+                        covs[i] + np.outer(diff, diff)
+                    )
+
+                mixed_mus.append(mu_bar)
+                mixed_covs.append(P_bar)
+
+            # --- 2️⃣ Regime Prediction ---
             regime_probs = self.model.Pi.T @ regime_probs
 
             likelihoods = np.zeros(self.K)
             new_mus = []
             new_covs = []
 
-            # --- 2. Run K Kalman filters ---
+            # --- 3️⃣ Run K Kalman Filters ---
             for k in range(self.K):
 
                 kf = KalmanFilter(
@@ -41,8 +69,8 @@ class SwitchingKalmanFilter:
                     self.model.C[k],
                     self.model.Q[k],
                     self.model.R[k],
-                    mus[k],
-                    covs[k],
+                    mixed_mus[k],
+                    mixed_covs[k],
                 )
 
                 kf.predict()
@@ -51,10 +79,9 @@ class SwitchingKalmanFilter:
                 new_mus.append(kf.mu)
                 new_covs.append(kf.P)
 
-                # Likelihood under regime k
                 likelihoods[k] = self._gaussian_pdf(innovation, S)
 
-            # --- 3. Update regime probabilities ---
+            # --- 4️⃣ Update Regime Probabilities ---
             regime_probs = regime_probs * likelihoods
             regime_probs /= np.sum(regime_probs)
 
