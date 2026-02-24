@@ -6,9 +6,16 @@ class KalmanSmoother:
         self.A = A
         self.Q = Q
 
-    def smooth(self, filtered_means, filtered_covs):
+    def smooth(
+        self,
+        filtered_means,
+        filtered_covs,
+        predicted_covs,
+    ):
         """
-        Rauch–Tung–Striebel (RTS) Smoother
+        Full RTS smoother with lag-one cross-covariances.
+
+        predicted_covs: P_{t|t-1} from forward pass
         """
 
         T, dim = filtered_means.shape
@@ -16,19 +23,17 @@ class KalmanSmoother:
         smoothed_means = np.copy(filtered_means)
         smoothed_covs = np.copy(filtered_covs)
 
+        cross_covs = np.zeros((T - 1, dim, dim))
+
         for t in reversed(range(T - 1)):
 
             P_t = filtered_covs[t]
-
-            # Predicted covariance P_{t+1|t}
-            P_pred = (
-                self.A @ P_t @ self.A.T + self.Q
-            )
+            P_pred_next = predicted_covs[t + 1]
 
             # Smoother gain
-            G = P_t @ self.A.T @ np.linalg.inv(P_pred)
+            G = P_t @ self.A.T @ np.linalg.inv(P_pred_next)
 
-            # Mean update
+            # Mean smoothing
             smoothed_means[t] = (
                 filtered_means[t]
                 + G @ (
@@ -37,13 +42,18 @@ class KalmanSmoother:
                 )
             )
 
-            # Covariance update
+            # Covariance smoothing
             smoothed_covs[t] = (
                 P_t
                 + G @ (
                     smoothed_covs[t + 1]
-                    - P_pred
+                    - P_pred_next
                 ) @ G.T
             )
 
-        return smoothed_means, smoothed_covs
+            # Cross covariance
+            cross_covs[t] = (
+                G @ smoothed_covs[t + 1]
+            )
+
+        return smoothed_means, smoothed_covs, cross_covs
