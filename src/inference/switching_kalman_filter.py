@@ -12,6 +12,7 @@ class SwitchingKalmanFilter:
         dim = self.model.mu0.shape[0]
 
         regime_probs = self.model.pi0.copy()
+        log_regime_probs = np.log(regime_probs + 1e-16)
 
         mus = [self.model.mu0.copy() for _ in range(self.K)]
         covs = [self.model.P0.copy() for _ in range(self.K)]
@@ -19,31 +20,28 @@ class SwitchingKalmanFilter:
         regime_history = np.zeros((T, self.K))
         state_history = np.zeros((T, self.K, dim))
 
-        log_likelihood = 0.0
+        total_log_likelihood = 0.0
 
         for t in range(T):
 
-            # --- 1️⃣ Mixing Step ---
+            # --- MIXING STEP ---
             mixed_mus = []
             mixed_covs = []
 
             for j in range(self.K):
 
-                # mixing probabilities
                 denom = np.sum(
-                    self.model.Pi[:, j] * regime_probs
+                    self.model.Pi[:, j] * np.exp(log_regime_probs)
                 )
 
                 mixing_probs = (
-                    self.model.Pi[:, j] * regime_probs
-                ) / denom
+                    self.model.Pi[:, j] * np.exp(log_regime_probs)
+                ) / (denom + 1e-16)
 
-                # mixed mean
                 mu_bar = np.zeros(dim)
                 for i in range(self.K):
                     mu_bar += mixing_probs[i] * mus[i]
 
-                # mixed covariance
                 P_bar = np.zeros((dim, dim))
                 for i in range(self.K):
                     diff = mus[i] - mu_bar
@@ -54,14 +52,16 @@ class SwitchingKalmanFilter:
                 mixed_mus.append(mu_bar)
                 mixed_covs.append(P_bar)
 
-            # --- 2️⃣ Regime Prediction ---
-            regime_probs = self.model.Pi.T @ regime_probs
+            # --- REGIME PREDICTION (log space) ---
+            log_regime_pred = np.log(
+                self.model.Pi.T @ np.exp(log_regime_probs) + 1e-16
+            )
 
-            likelihoods = np.zeros(self.K)
+            log_likelihoods = np.zeros(self.K)
             new_mus = []
             new_covs = []
 
-            # --- 3️⃣ Run K Kalman Filters ---
+            # --- RUN FILTERS ---
             for k in range(self.K):
 
                 kf = KalmanFilter(
@@ -79,13 +79,23 @@ class SwitchingKalmanFilter:
                 new_mus.append(kf.mu)
                 new_covs.append(kf.P)
 
-                likelihoods[k] = self._gaussian_pdf(innovation, S)
+                log_likelihoods[k] = self._log_gaussian(
+                    innovation, S
+                )
 
-            # --- 4️⃣ Update Regime Probabilities ---
-            regime_probs = regime_probs * likelihoods
-            regime_probs /= np.sum(regime_probs)
+            # --- LOG PROB UPDATE ---
+            log_regime_post = log_regime_pred + log_likelihoods
 
-            log_likelihood += np.log(np.sum(likelihoods))
+            # log-sum-exp normalization
+            m = np.max(log_regime_post)
+            log_sum = m + np.log(
+                np.sum(np.exp(log_regime_post - m))
+            )
+
+            log_regime_probs = log_regime_post - log_sum
+            regime_probs = np.exp(log_regime_probs)
+
+            total_log_likelihood += log_sum
 
             mus = new_mus
             covs = new_covs
@@ -94,13 +104,16 @@ class SwitchingKalmanFilter:
             for k in range(self.K):
                 state_history[t, k] = mus[k]
 
-        return regime_history, state_history, log_likelihood
+        return regime_history, state_history, total_log_likelihood
 
     @staticmethod
-    def _gaussian_pdf(e, S):
+    def _log_gaussian(e, S):
         d = e.shape[0]
-        det = np.linalg.det(S)
+        sign, logdet = np.linalg.slogdet(S)
         inv = np.linalg.inv(S)
-        norm_const = 1.0 / np.sqrt((2 * np.pi) ** d * det)
-        exponent = -0.5 * e.T @ inv @ e
-        return norm_const * np.exp(exponent)
+
+        return (
+            -0.5 * d * np.log(2 * np.pi)
+            -0.5 * logdet
+            -0.5 * e.T @ inv @ e
+        )
