@@ -1,106 +1,91 @@
 import numpy as np
-from .kalman_filter import KalmanFilter
 
 
-class SwitchingKalmanFilter:
-    def __init__(self, model):
-        self.model = model
-        self.K = model.K
+class KalmanFilter:
+    def __init__(self, A, C, Q, R, mu0, P0):
+        self.A = A
+        self.C = C
+        self.Q = Q
+        self.R = R
+        self.mu0 = mu0
+        self.P0 = P0
+
+        self.reset()
+
+    def reset(self):
+        self.mu = self.mu0.copy()
+        self.P = self.P0.copy()
+
+    def predict(self):
+        """
+        z_t|t-1 = A z_t-1
+        P_t|t-1 = A P_t-1 A^T + Q
+        """
+        self.mu = self.A @ self.mu
+        self.P = self.A @ self.P @ self.A.T + self.Q
+        return self.mu, self.P
+
+    def update(self, x):
+        """
+        Stable Joseph-form update
+        """
+        S = self.C @ self.P @ self.C.T + self.R
+        K = self.P @ self.C.T @ np.linalg.inv(S)
+
+        innovation = x - self.C @ self.mu
+        self.mu = self.mu + K @ innovation
+
+        I = np.eye(self.P.shape[0])
+        self.P = (
+            (I - K @ self.C) @ self.P @ (I - K @ self.C).T
+            + K @ self.R @ K.T
+        )
+
+        return innovation, S
 
     def filter(self, observations):
+        """
+        Returns:
+        - filtered means
+        - filtered covariances
+        - predicted covariances
+        - total log-likelihood
+        """
+
         T = observations.shape[0]
-        dim = self.model.mu0.shape[0]
+        dim = self.mu.shape[0]
 
-        regime_probs = self.model.pi0.copy()
-
-        mus = [self.model.mu0.copy() for _ in range(self.K)]
-        covs = [self.model.P0.copy() for _ in range(self.K)]
-
-        regime_history = np.zeros((T, self.K))
-        state_history = np.zeros((T, self.K, dim))
+        mus = np.zeros((T, dim))
+        covs = np.zeros((T, dim, dim))
+        predicted_covs = np.zeros((T, dim, dim))
 
         log_likelihood = 0.0
 
         for t in range(T):
 
-            # --- 1️⃣ Mixing Step ---
-            mixed_mus = []
-            mixed_covs = []
+            _, P_pred = self.predict()
+            predicted_covs[t] = P_pred.copy()
 
-            for j in range(self.K):
+            innovation, S = self.update(observations[t])
 
-                # mixing probabilities
-                denom = np.sum(
-                    self.model.Pi[:, j] * regime_probs
-                )
+            mus[t] = self.mu
+            covs[t] = self.P
 
-                mixing_probs = (
-                    self.model.Pi[:, j] * regime_probs
-                ) / denom
+            log_likelihood += self._log_gaussian(innovation, S)
 
-                # mixed mean
-                mu_bar = np.zeros(dim)
-                for i in range(self.K):
-                    mu_bar += mixing_probs[i] * mus[i]
-
-                # mixed covariance
-                P_bar = np.zeros((dim, dim))
-                for i in range(self.K):
-                    diff = mus[i] - mu_bar
-                    P_bar += mixing_probs[i] * (
-                        covs[i] + np.outer(diff, diff)
-                    )
-
-                mixed_mus.append(mu_bar)
-                mixed_covs.append(P_bar)
-
-            # --- 2️⃣ Regime Prediction ---
-            regime_probs = self.model.Pi.T @ regime_probs
-
-            likelihoods = np.zeros(self.K)
-            new_mus = []
-            new_covs = []
-
-            # --- 3️⃣ Run K Kalman Filters ---
-            for k in range(self.K):
-
-                kf = KalmanFilter(
-                    self.model.A[k],
-                    self.model.C[k],
-                    self.model.Q[k],
-                    self.model.R[k],
-                    mixed_mus[k],
-                    mixed_covs[k],
-                )
-
-                kf.predict()
-                innovation, S = kf.update(observations[t])
-
-                new_mus.append(kf.mu)
-                new_covs.append(kf.P)
-
-                likelihoods[k] = self._gaussian_pdf(innovation, S)
-
-            # --- 4️⃣ Update Regime Probabilities ---
-            regime_probs = regime_probs * likelihoods
-            regime_probs /= np.sum(regime_probs)
-
-            log_likelihood += np.log(np.sum(likelihoods))
-
-            mus = new_mus
-            covs = new_covs
-
-            regime_history[t] = regime_probs
-            for k in range(self.K):
-                state_history[t, k] = mus[k]
-
-        return regime_history, state_history, log_likelihood
+        return mus, covs, predicted_covs, log_likelihood
 
     @staticmethod
-    def _gaussian_pdf(e, S):
+    def _log_gaussian(e, S):
+        """
+        Stable log-density using slogdet
+        """
         d = e.shape[0]
-        det = np.linalg.det(S)
+        sign, logdet = np.linalg.slogdet(S)
         inv = np.linalg.inv(S)
-        norm_const = 1.0 / np.sqrt((2 * np.pi) ** d * det)
-        exponent = -0.5 * e.T @ inv @ e
-        return norm_const * np.exp(exponent)
+
+        return (
+            -0.5 * d * np.log(2 * np.pi)
+            -0.5 * logdet
+            -0.5 * e.T @ inv @ e
+        )
