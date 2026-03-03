@@ -1,0 +1,513 @@
+"""
+ECG-TransNet — Explainability Figure Generator
+================================================
+Generates Figure 6: Grad-CAM (top row) + SHAP (bottom row)
+for three representative arrhythmia classes:
+  - Class 0: Normal beat
+  - Class 2: Ventricular ectopic beat
+  - Class 4: Right bundle branch block
+
+REQUIREMENTS:
+    pip install torch numpy matplotlib shap scipy
+
+USAGE:
+    1. Replace the MODEL LOADING section with your actual model.
+    2. Replace the DATA LOADING section with your actual data.
+    3. Run: python generate_xai_figure.py
+    4. Output saved as: xai_figure.pdf and xai_figure.png
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import torch
+import torch.nn as nn
+import shap
+from scipy.ndimage import zoom
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION — edit these to match your setup
+# ──────────────────────────────────────────────────────────────────────────────
+MODEL_PATH       = "ecg_transnet_best.pth"   # path to your saved model weights
+SEGMENT_LENGTH   = 250                        # samples per beat segment
+NUM_CLASSES      = 23
+TARGET_CLASSES   = [0, 2, 4]                  # classes to visualize
+CLASS_NAMES      = {
+    0: "Normal Beat\n(Class 0)",
+    2: "Ventricular Ectopic\n(Class 2)",
+    4: "Right Bundle Branch Block\n(Class 4)"
+}
+SHAP_BACKGROUND  = 100   # number of background samples for SHAP DeepExplainer
+OUTPUT_PDF       = "xai_figure.pdf"
+OUTPUT_PNG       = "xai_figure.png"
+DEVICE           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+RANDOM_SEED      = 42
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 1: MODEL DEFINITION
+# Paste your exact ECG-TransNet class here.
+# The example below matches the architecture described in the paper.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, dropout=0.3):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size, padding=kernel_size // 2),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.block(x)
+
+
+class ECGTransNet(nn.Module):
+    def __init__(self, num_classes=23, d_model=128, nhead=4,
+                 num_encoder_layers=2, dim_feedforward=256,
+                 dropout=0.3, attn_dropout=0.1):
+        super().__init__()
+        # CNN backbone
+        self.conv1 = ConvBlock(1,  32,  5, dropout)
+        self.conv2 = ConvBlock(32, 64,  5, dropout)
+        self.conv3 = ConvBlock(64, 128, 3, dropout)
+
+        # Embedding projection
+        self.proj = nn.Conv1d(128, d_model, kernel_size=1)
+
+        # Positional encoding (sinusoidal, fixed)
+        self.register_buffer(
+            "pos_enc",
+            self._build_pos_enc(seq_len=31, d_model=d_model)
+        )
+
+        # Transformer encoder
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=attn_dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer,
+                                                  num_layers=num_encoder_layers)
+
+        # Classification head
+        self.classifier = nn.Linear(d_model, num_classes)
+
+    @staticmethod
+    def _build_pos_enc(seq_len, d_model):
+        pe = torch.zeros(seq_len, d_model)
+        pos = torch.arange(0, seq_len).unsqueeze(1).float()
+        div = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        return pe.unsqueeze(0)   # (1, seq_len, d_model)
+
+    def forward(self, x):
+        # x: (B, 1, 250)
+        x = self.conv1(x)        # (B, 32,  125)
+        x = self.conv2(x)        # (B, 64,   62)
+        x = self.conv3(x)        # (B, 128,  31)
+        x = self.proj(x)         # (B, 128,  31)
+        x = x.permute(0, 2, 1)  # (B, 31, 128)
+        x = x + self.pos_enc
+        x = self.transformer(x) # (B, 31, 128)
+        x = x.mean(dim=1)       # (B, 128)  — global average pool
+        return self.classifier(x)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 2: GRAD-CAM IMPLEMENTATION
+# Hooks into the last conv block to extract activations and gradients.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GradCAM1D:
+    """
+    Grad-CAM for 1D CNN layers.
+    target_layer: the nn.Module layer to hook (e.g. model.conv3.block[0])
+    """
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.activations = None
+        self.gradients   = None
+        self._register_hooks()
+
+    def _register_hooks(self):
+        def forward_hook(module, input, output):
+            # output shape: (B, C, L)
+            self.activations = output.detach()
+
+        def backward_hook(module, grad_in, grad_out):
+            # grad_out[0] shape: (B, C, L)
+            self.gradients = grad_out[0].detach()
+
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_full_backward_hook(backward_hook)
+
+    def generate(self, input_tensor, target_class):
+        """
+        input_tensor : (1, 1, 250) torch tensor on DEVICE
+        target_class : int
+        Returns saliency map of shape (250,) normalized to [0, 1]
+        """
+        self.model.zero_grad()
+        output = self.model(input_tensor)          # (1, 23)
+        score  = output[0, target_class]
+        score.backward()
+
+        # Global average pool gradients over temporal dimension
+        weights = self.gradients.mean(dim=2, keepdim=True)   # (1, C, 1)
+
+        # Weighted combination of activation maps
+        cam = (weights * self.activations).sum(dim=1)        # (1, L)
+        cam = torch.relu(cam).squeeze().cpu().numpy()        # (L,)
+
+        # Upsample from feature map length (~31) to input length (250)
+        if cam.shape[0] != 250:
+            scale = 250 / cam.shape[0]
+            cam   = zoom(cam, scale)
+
+        # Normalize to [0, 1]
+        cam_min, cam_max = cam.min(), cam.max()
+        if cam_max - cam_min > 1e-8:
+            cam = (cam - cam_min) / (cam_max - cam_min)
+        else:
+            cam = np.zeros_like(cam)
+
+        return cam
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 3: DATA LOADING
+# Replace this section with your actual data loader.
+# Expected format: numpy arrays of shape (N, 250) with integer labels.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_representative_samples(target_classes):
+    """
+    Returns one representative segment per target class.
+
+    REPLACE THIS FUNCTION with your actual data loading logic, e.g.:
+        X_test = np.load("X_test.npy")   # shape (N, 250)
+        y_test = np.load("y_test.npy")   # shape (N,)
+
+    The function should return:
+        segments : dict {class_int: np.array of shape (250,)}
+    """
+    # ── REPLACE BELOW with your real data ──────────────────────────────────
+    # Example skeleton (uncomment and adapt):
+    #
+    # X_test = np.load("X_test.npy")
+    # y_test = np.load("y_test.npy")
+    # segments = {}
+    # for cls in target_classes:
+    #     idx = np.where(y_test == cls)[0]
+    #     # Pick the sample with highest model confidence for clean visualization
+    #     segments[cls] = X_test[idx[0]]
+    # return segments
+    # ────────────────────────────────────────────────────────────────────────
+
+    # PLACEHOLDER synthetic signals (remove once you supply real data)
+    np.random.seed(RANDOM_SEED)
+    t = np.linspace(0, 1, 250)
+    segments = {}
+
+    # Class 0: narrow QRS normal beat
+    ecg0 = 0.1 * np.sin(2 * np.pi * 3 * t)
+    ecg0 += 2.0 * np.exp(-((t - 0.5) ** 2) / (2 * 0.005 ** 2))   # R peak
+    ecg0 += 0.3 * np.exp(-((t - 0.42) ** 2) / (2 * 0.012 ** 2))  # P wave
+    ecg0 += 0.25 * np.exp(-((t - 0.62) ** 2) / (2 * 0.018 ** 2)) # T wave
+    ecg0 += np.random.normal(0, 0.02, 250)
+    segments[0] = ecg0
+
+    # Class 2: wide notched QRS ventricular ectopic
+    ecg2 = 0.05 * np.sin(2 * np.pi * 2 * t)
+    ecg2 += 1.8 * np.exp(-((t - 0.48) ** 2) / (2 * 0.012 ** 2))
+    ecg2 += 1.2 * np.exp(-((t - 0.54) ** 2) / (2 * 0.010 ** 2))  # notch
+    ecg2 -= 0.4 * np.exp(-((t - 0.68) ** 2) / (2 * 0.025 ** 2))  # inverted T
+    ecg2 += np.random.normal(0, 0.025, 250)
+    segments[2] = ecg2
+
+    # Class 4: RBBB — rSR' pattern + T wave inversion
+    ecg4 = 0.08 * np.sin(2 * np.pi * 3 * t)
+    ecg4 += 1.5 * np.exp(-((t - 0.47) ** 2) / (2 * 0.006 ** 2))
+    ecg4 += 0.7 * np.exp(-((t - 0.53) ** 2) / (2 * 0.006 ** 2))  # R'
+    ecg4 += 0.25 * np.exp(-((t - 0.40) ** 2) / (2 * 0.010 ** 2)) # P wave
+    ecg4 -= 0.35 * np.exp(-((t - 0.65) ** 2) / (2 * 0.022 ** 2)) # inverted T
+    ecg4 += np.random.normal(0, 0.02, 250)
+    segments[4] = ecg4
+
+    return segments
+
+
+def load_background_samples(n=100):
+    """
+    Returns a background dataset for SHAP DeepExplainer (shape: N x 1 x 250).
+
+    REPLACE with a random sample of your actual training data:
+        X_train = np.load("X_train.npy")   # shape (N_train, 250)
+        idx = np.random.choice(len(X_train), n, replace=False)
+        bg  = X_train[idx][:, np.newaxis, :]   # (n, 1, 250)
+        return torch.tensor(bg, dtype=torch.float32).to(DEVICE)
+    """
+    np.random.seed(RANDOM_SEED)
+    bg = np.random.randn(n, 1, 250).astype(np.float32) * 0.3
+    return torch.tensor(bg).to(DEVICE)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 4: FIGURE GENERATION
+# ──────────────────────────────────────────────────────────────────────────────
+
+def pick_confident_sample(model, X_test, y_test, target_class, device):
+    """
+    Utility: from your test set, find the sample for target_class with
+    highest model confidence (softmax probability). Returns the segment.
+    Use this instead of taking the first sample — it gives cleaner figures.
+
+    X_test : np.array (N, 250)
+    y_test : np.array (N,)
+    """
+    model.eval()
+    idx_cls = np.where(y_test == target_class)[0]
+    best_prob, best_seg = -1, None
+    with torch.no_grad():
+        for idx in idx_cls[:200]:   # check at most 200 candidates
+            seg = torch.tensor(X_test[idx][np.newaxis, np.newaxis, :],
+                               dtype=torch.float32).to(device)
+            prob = torch.softmax(model(seg), dim=1)[0, target_class].item()
+            if prob > best_prob:
+                best_prob = prob
+                best_seg  = X_test[idx]
+    return best_seg
+
+
+def generate_figure(model, segments, background_tensor):
+
+    model.eval()
+
+    # ── Grad-CAM setup ───────────────────────────────────────────────────────
+    # Hook into the Conv1d inside conv3 (the third convolutional block)
+    gradcam = GradCAM1D(model, target_layer=model.conv3.block[0])
+
+    # ── SHAP setup ───────────────────────────────────────────────────────────
+    explainer = shap.DeepExplainer(model, background_tensor)
+
+    # ── Collect maps ─────────────────────────────────────────────────────────
+    cams, shap_vals, raw_segs = {}, {}, {}
+
+    for cls in TARGET_CLASSES:
+        seg_np = segments[cls]                                   # (250,)
+        raw_segs[cls] = seg_np
+
+        seg_t = torch.tensor(
+            seg_np[np.newaxis, np.newaxis, :], dtype=torch.float32
+        ).to(DEVICE)
+
+        # Grad-CAM
+        cam = gradcam.generate(seg_t, target_class=cls)
+        cams[cls] = cam
+
+        # SHAP  — returns list of arrays; index 0 = input channel
+        sv = explainer.shap_values(seg_t)
+        # sv shape: (num_classes, batch, 1, 250)  OR  list length num_classes
+        if isinstance(sv, list):
+            sv_cls = sv[cls][0, 0, :]          # (250,)
+        else:
+            sv_cls = sv[cls, 0, 0, :]
+        shap_vals[cls] = sv_cls
+
+    # ── Plotting ─────────────────────────────────────────────────────────────
+    t = np.arange(250)
+
+    fig = plt.figure(figsize=(16, 8))
+    fig.patch.set_facecolor("white")
+
+    outer = gridspec.GridSpec(
+        2, 3,
+        figure=fig,
+        hspace=0.55,
+        wspace=0.35,
+        top=0.88,
+        bottom=0.10,
+        left=0.07,
+        right=0.97
+    )
+
+    row_labels = ["Grad-CAM Saliency", "SHAP Attribution"]
+    col_titles = [CLASS_NAMES[c] for c in TARGET_CLASSES]
+
+    # ── Color palette ─────────────────────────────────────────────────────────
+    ECG_COLOR      = "#2c3e50"   # dark navy for ECG trace
+    OVERLAY_CMAP   = "Oranges"
+    SHAP_POS_COLOR = "#2980b9"   # blue  — increases predicted probability
+    SHAP_NEG_COLOR = "#e74c3c"   # red   — decreases predicted probability
+
+    for col_i, cls in enumerate(TARGET_CLASSES):
+
+        seg  = raw_segs[cls]
+        cam  = cams[cls]
+        sv   = shap_vals[cls]
+
+        # ── ROW 0: Grad-CAM ──────────────────────────────────────────────────
+        ax_cam = fig.add_subplot(outer[0, col_i])
+
+        # ECG trace
+        ax_cam.plot(t, seg, color=ECG_COLOR, linewidth=1.2, zorder=3)
+
+        # Orange overlay: shade under ECG weighted by CAM value
+        y_min = seg.min() - 0.15 * (seg.max() - seg.min())
+        y_max = seg.max() + 0.15 * (seg.max() - seg.min())
+        ax_cam.set_ylim(y_min, y_max)
+
+        # Fill between ECG baseline and waveform, alpha modulated by cam
+        for i in range(len(t) - 1):
+            alpha = float(cam[i]) * 0.85
+            if alpha > 0.04:
+                ax_cam.fill_between(
+                    t[i:i+2], y_min, seg[i:i+2],
+                    color="darkorange", alpha=alpha, linewidth=0
+                )
+
+        # Colorbar-style gradient bar below the axis
+        cb_ax = ax_cam.inset_axes([0.0, -0.22, 1.0, 0.08])
+        cb_data = cam[np.newaxis, :]
+        cb_ax.imshow(cb_data, aspect="auto", cmap=OVERLAY_CMAP,
+                     vmin=0, vmax=1, interpolation="bilinear")
+        cb_ax.set_xticks([])
+        cb_ax.set_yticks([])
+        cb_ax.set_xlabel("Activation magnitude →",
+                         fontsize=7, labelpad=3, color="#7f8c8d")
+
+        ax_cam.set_xlim(0, 249)
+        ax_cam.set_title(col_titles[col_i], fontsize=10,
+                         fontweight="bold", pad=8)
+        ax_cam.set_ylabel("Amplitude (a.u.)", fontsize=8)
+        ax_cam.tick_params(labelsize=7)
+        ax_cam.spines[["top", "right"]].set_visible(False)
+
+        # Row label on leftmost column
+        if col_i == 0:
+            ax_cam.annotate(
+                "Grad-CAM\nSaliency",
+                xy=(-0.22, 0.5), xycoords="axes fraction",
+                fontsize=9, fontweight="bold", va="center", ha="center",
+                rotation=90, color="#2c3e50"
+            )
+
+        # ── ROW 1: SHAP ──────────────────────────────────────────────────────
+        ax_shap = fig.add_subplot(outer[1, col_i])
+
+        pos_sv = np.where(sv > 0, sv, 0)
+        neg_sv = np.where(sv < 0, sv, 0)
+
+        ax_shap.bar(t, pos_sv, width=1.0, color=SHAP_POS_COLOR,
+                    alpha=0.85, linewidth=0, label="Increases P(class)")
+        ax_shap.bar(t, neg_sv, width=1.0, color=SHAP_NEG_COLOR,
+                    alpha=0.75, linewidth=0, label="Decreases P(class)")
+        ax_shap.axhline(0, color="#7f8c8d", linewidth=0.7, linestyle="--")
+
+        # Overlay faint ECG trace for spatial reference
+        ax2 = ax_shap.twinx()
+        ax2.plot(t, seg, color=ECG_COLOR, linewidth=0.8,
+                 alpha=0.30, zorder=2)
+        ax2.set_yticks([])
+        ax2.spines[["top", "right"]].set_visible(False)
+
+        ax_shap.set_xlim(0, 249)
+        ax_shap.set_xlabel("Sample index (0–249)", fontsize=8, labelpad=4)
+        ax_shap.set_ylabel("SHAP value", fontsize=8)
+        ax_shap.tick_params(labelsize=7)
+        ax_shap.spines[["top", "right"]].set_visible(False)
+
+        if col_i == 0:
+            ax_shap.legend(fontsize=7, loc="upper left",
+                           framealpha=0.6, edgecolor="none")
+            ax_shap.annotate(
+                "SHAP\nAttribution",
+                xy=(-0.22, 0.5), xycoords="axes fraction",
+                fontsize=9, fontweight="bold", va="center", ha="center",
+                rotation=90, color="#2c3e50"
+            )
+
+    # ── Global title ─────────────────────────────────────────────────────────
+    fig.suptitle(
+        "ECG-TransNet Explainability Analysis: Grad-CAM and SHAP Attribution",
+        fontsize=13, fontweight="bold", y=0.97, color="#2c3e50"
+    )
+
+    # ── Caption-style annotation at bottom ───────────────────────────────────
+    fig.text(
+        0.5, 0.01,
+        "Top row: Grad-CAM saliency maps (orange overlay) superimposed on ECG segments. "
+        "Bottom row: SHAP attribution profiles — blue bars increase, red bars decrease predicted class probability. "
+        "Faint grey trace = raw ECG (reference). Attribution is consistently concentrated over QRS-complex and ST-segment regions.",
+        ha="center", va="bottom", fontsize=7.5,
+        color="#555555", wrap=True,
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#f8f9fa",
+                  edgecolor="#dee2e6", alpha=0.8)
+    )
+
+    return fig
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 5: MAIN ENTRY POINT
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main():
+    torch.manual_seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+
+    # ── Load model ────────────────────────────────────────────────────────────
+    print("Loading ECG-TransNet model...")
+    model = ECGTransNet(num_classes=NUM_CLASSES).to(DEVICE)
+
+    try:
+        state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
+        # Handle DataParallel prefix if present
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+        print(f"  ✓ Model weights loaded from: {MODEL_PATH}")
+    except FileNotFoundError:
+        print(f"  ⚠ Model file '{MODEL_PATH}' not found.")
+        print("    Running with random weights for layout preview only.")
+        print("    → Load your trained weights before final figure generation.\n")
+
+    model.eval()
+
+    # ── Load data ─────────────────────────────────────────────────────────────
+    print("Loading representative ECG segments...")
+    segments = load_representative_samples(TARGET_CLASSES)
+    print(f"  ✓ Loaded segments for classes: {TARGET_CLASSES}")
+
+    print("Loading SHAP background samples...")
+    background = load_background_samples(n=SHAP_BACKGROUND)
+    print(f"  ✓ Background tensor shape: {tuple(background.shape)}")
+
+    # ── Generate figure ───────────────────────────────────────────────────────
+    print("\nGenerating Grad-CAM saliency maps and SHAP attributions...")
+    fig = generate_figure(model, segments, background)
+
+    # ── Save ─────────────────────────────────────────────────────────────────
+    fig.savefig(OUTPUT_PDF, dpi=300, bbox_inches="tight",
+                facecolor="white", format="pdf")
+    fig.savefig(OUTPUT_PNG, dpi=300, bbox_inches="tight",
+                facecolor="white", format="png")
+    plt.close(fig)
+
+    print(f"\n  ✓ Figure saved as: {OUTPUT_PDF}")
+    print(f"  ✓ Figure saved as: {OUTPUT_PNG}")
+    print("\nDone. Use xai_figure.pdf in your LaTeX paper.")
+
+
+if __name__ == "__main__":
+    main()
